@@ -1,0 +1,41 @@
+﻿name: Reusable  Quality Gate (Q-API 3.3)
+
+on:
+  workflow_call:
+
+jobs:
+  lint-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate OpenAPI 3.1.x syntax
+        uses: char0n/swagger-editor-validate@v1
+        with:
+          definition-file: |
+            **/*.yaml
+            **/*.yml
+
+      - name: Q-API 3.3 Profile compliance checks
+        shell: bash
+        run: |
+          FAIL=0
+          while IFS= read -r -d '' f; do
+            echo " Checking $f"
+            # 1) 必须声明 Q-API 3.3
+            if ! grep -q 'x-qapi-profile: "3.3"' "$f"; then
+              echo "::error file=$f::Missing info.x-qapi-profile: \"3.3\"" && FAIL=1
+            fi
+            # 2) 必须有标准头
+            if ! grep -q 'X-QAPI-Version' "$f"; then
+              echo "::error file=$f::Missing components.headers.X-QAPI-Version" && FAIL=1
+            fi
+            # 3) P0 阶段：写操作需禁用
+            if grep -q 'x-qapi-write:' "$f"; then
+              if ! grep -A2 'x-qapi-write:' "$f" | grep -q 'status: disabled'; then
+                echo "::warning file=$f::x-qapi-write present but not disabled (P0 must disable writes)"
+              fi
+            fi
+          done < <(find . -type f \( -name '*.yaml' -o -name '*.yml' \) -print0)
+          exit $FAIL
