@@ -1,0 +1,55 @@
+name: Reusable Build & Test (Go)
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: 'Go version (semver or x-range)'
+        required: false
+        default: '1.22.x'
+        type: string
+      run-tests:
+        description: 'Run go test after build'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ inputs.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+
+      - name: Go env
+        run: |
+          go env
+          go version
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        if: ${{ inputs.run-tests }}
+        run: |
+          go test ./... -v -race -count=1 -coverprofile=coverage.out
+
+      - name: Upload coverage artifact
+        if: ${{ inputs.run-tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
