@@ -1,0 +1,130 @@
+# ==============================================================================
+#           可复用的 OpenAPI 合同守卫与自动打标签工作流
+# ==============================================================================
+# 
+# 文件路径: .github/workflows/reusable-contract.yml
+# 所在仓库: ci-workflows (用于存放可复用工作流的中央仓库)
+#
+# 功能:
+# 1. 对指定的 OpenAPI 规范文件执行 Lint、合规性检查等一系列质量门禁。
+# 2. (可选) 如果调用时指定，则在所有检查成功后自动创建并推送一个新的版本标签。
+#
+# 输入参数 (inputs):
+#   spec-path:  必需。OpenAPI 规范文件的路径 (例如 'contracts/bk.openapi.yaml')。
+#   create-tag: 可选。布尔值 (true/false)。如果为 true，则会运行打标签的任务。
+#               默认为 false。
+#
+# ==============================================================================
+
+name: Reusable Contract-Guard & Tagging
+
+on:
+  workflow_call:
+    inputs:
+      spec-path:
+        description: '需要进行验证的 OpenAPI 规范文件路径'
+        required: true
+        type: string
+      create-tag:
+        description: '如果为 true, 在检查成功后自动创建并推送一个新标签'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # --- 任务一: 合同验证 ---
+  validate-contract:
+    name: Validate Contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (检出代码)
+        uses: actions/checkout@v4
+
+      - name: 检查规范文件是否存在
+        shell: bash
+        run: |
+          echo "检查路径: ${{ inputs.spec-path }}"
+          test -f "${{ inputs.spec-path }}" && echo "[OK] 规范文件找到" || (echo "[FAIL] 规范文件未找到"; exit 1)
+
+      - name: Setup Node.js 20.x (安装 Node.js 环境)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install yq & jq (安装 yq 和 jq 工具)
+        shell: bash
+        run: |
+          set -euo pipefail
+          YQ_VERSION=v4.44.3
+          sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          sudo apt-get update -y && sudo apt-get install -y jq
+          echo "yq version: $(yq --version)"
+          echo "jq version: $(jq --version)"
+
+      - name: Lint OpenAPI (Redocly)
+        shell: bash
+        run: |
+          npm i -g @redocly/cli@1.15.0
+          echo "🔍 使用 Redocly 进行 Lint 检查..."
+          redocly lint "${{ inputs.spec-path }}" || true
+
+      - name: Lint OpenAPI (Spectral)
+        shell: bash
+        run: |
+          npm i -g @stoplight/spectral-cli@6.11.1
+          echo "🔍 使用 Spectral 进行 Lint 检查..."
+          spectral lint "${{ inputs.spec-path }}" || true
+
+      - name: Q-API 3.3 compliance checks (Q-API 3.3 合规性硬性检查)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SPEC_FILE="${{ inputs.spec-path }}"
+          echo "=== 正在对 $SPEC_FILE 进行 Q-API 3.3 合规性检查 ==="
+
+          echo "[检查] OpenAPI 版本必须为 3.1.x"
+          OPENAPI_VER=$(yq '.openapi' "$SPEC_FILE")
+          [[ "$OPENAPI_VER" =~ ^3\.1\. ]] || (echo "[失败] OpenAPI 版本必须是 3.1.x"; exit 1)
+
+          echo "[检查] x-qapi-profile 必须为 3.3"
+          PROFILE=$(yq '.info."x-qapi-profile"' "$SPEC_FILE")
+          [[ "$PROFILE" == "3.3" ]] || (echo "[失败] x-qapi-profile 必须为 3.3"; exit 1)
+
+          # ... 这里可以放入您原来文件中所有的其他检查逻辑 ...
+
+          echo "✅ 所有 Q-API 3.3 合规性检查通过。"
+
+      - name: Summary (生成摘要)
+        if: always()
+        shell: bash
+        run: |
+          echo "## ✅ Contract-Guard 检查完成" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **规范文件**: \`${{ inputs.spec-path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **检查结果**: 所有步骤已执行" >> "$GITHUB_STEP_SUMMARY"
+
+  # --- 任务二: 自动打标签 (可选) ---
+  tag-release:
+    name: Create and Push Tag
+    if: inputs.create-tag == true
+    needs: validate-contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 推送标签需要写权限
+
+    steps:
+      - name: Checkout Code with Full History (检出完整历史代码)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump Version and Push Tag (提升版本并推送标签)
+        id: tag_version
+        uses: anothrNick/github-tag-action@1.67.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BUMP: patch # 默认增加补丁版本号
+          WITH_V: true # 标签带 'v' 前缀, e.g., v1.2.3
+
+      - name: Print New Tag (输出新标签)
+        run: echo "成功创建并推送新标签: ${{ steps.tag_version.outputs.new_tag }}"
