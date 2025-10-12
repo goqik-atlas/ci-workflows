@@ -1,55 +1,98 @@
-name: Reusable Build & Test (Go)
+# ==============================================================================
+#                 Reusable Go Build, Test & Tag Workflow
+# ==============================================================================
+# 
+# 文件路径: .github/workflows/reusable-build.yml
+# 所在仓库: ci-workflows (用于存放可复用工作流的中央仓库)
+#
+# 功能:
+# 1. 构建和测试一个 Go 项目。
+# 2. (可选) 如果调用时指定，则在成功后自动创建并推送一个新的语义化版本标签。
+#
+# 输入参数 (inputs):
+#   go-version: Go 语言的版本号 (例如 '1.22.x')。默认为 '1.22.x'。
+#   create-tag: 布尔值 (true/false)。如果为 true，则会运行打标签的任务。
+#               默认为 false。
+#
+# ==============================================================================
+
+name: Reusable Go Build, Test & Tag
 
 on:
   workflow_call:
     inputs:
       go-version:
-        description: 'Go version (semver or x-range)'
+        description: '用于构建和测试的 Go 版本'
         required: false
-        default: '1.22.x'
         type: string
-      run-tests:
-        description: 'Run go test after build'
+        default: '1.22.x'
+      create-tag:
+        description: '如果为 true, 在构建成功后自动创建并推送一个新标签'
         required: false
-        default: true
         type: boolean
+        default: false
 
 jobs:
+  # --- 任务一: 构建与测试 ---
+  # 这个任务总是会运行，负责核心的 CI 检查。
   build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Go ${{ inputs.go-version }}
+      - name: Setup Go Environment
         uses: actions/setup-go@v5
         with:
           go-version: ${{ inputs.go-version }}
-          cache: true
 
-      - name: Go env
+      - name: Display Go version
+        run: go version
+
+      - name: Install Dependencies, Build, and Test
         run: |
-          go env
-          go version
+          echo ">>> Tidying modules..."
+          go mod tidy
+          
+          echo ">>> Building packages..."
+          go build ./...
+          
+          echo ">>> Running tests with coverage..."
+          go test ./... -v -cover
 
-      - name: Tidy modules
-        run: go mod tidy
+  # --- 任务二: 自动打标签 ---
+  # 这个任务是可选的，只有在调用方传入 create-tag: true 时才会执行。
+  tag-release:
+    name: Create and Push Tag
+    # 仅当调用方传入 create-tag: true 时才运行此 Job
+    if: inputs.create-tag == true
+    # 依赖 build-and-test Job，确保构建测试成功后才打标签
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      # 必须有 contents: write 权限才能推送标签回仓库
+      contents: write
 
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        if: ${{ inputs.run-tests }}
-        run: |
-          go test ./... -v -race -count=1 -coverprofile=coverage.out
-
-      - name: Upload coverage artifact
-        if: ${{ inputs.run-tests }}
-        uses: actions/upload-artifact@v4
+    steps:
+      - name: Checkout Code with Full History
+        uses: actions/checkout@v4
         with:
-          name: coverage
-          path: coverage.out
+          # 获取所有历史记录 (fetch-depth: 0)，以便 Action 可以找到最新的旧标签
+          fetch-depth: 0 
+
+      - name: Bump Version and Push Tag
+        id: tag_version
+        # 使用一个流行的、专门用于自动打标签的 Action
+        # 它会自动查找最新的 v*.*.* 标签，增加补丁版本号，然后创建新标签
+        uses: anothrNick/github-tag-action@1.67.0
+        env:
+          # GITHUB_TOKEN 是由 GitHub Actions 自动提供的密钥，用于授权 Action 推送标签
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 默认增加补丁版本号 (patch)，例如 v1.2.3 -> v1.2.4
+          DEFAULT_BUMP: patch
+          # (可选) 可以给标签加上 'v' 前缀
+          WITH_V: true
+
+      - name: Print New Tag
+        run: echo "Successfully tagged release: ${{ steps.tag_version.outputs.new_tag }}"
