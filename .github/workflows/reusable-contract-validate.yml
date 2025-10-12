@@ -1,33 +1,26 @@
 # ==============================================================================
-#           Reusable Contract Validation & Tagging Workflow
+#           [生产加固版] 可复用的 OpenAPI 合同守卫与自动打标签工作流
 # ==============================================================================
-#
-# This workflow validates an OpenAPI contract against Q-API 3.3 rules,
-# runs a smoke test for SDK generation, and optionally creates a new version tag.
-#
-# Inputs:
-#   spec-path:  Required. The path to the OpenAPI contract file.
-#   create-tag: Optional. If true, creates a new tag after successful validation.
-#
-# ==============================================================================
-
 name: Reusable Contract Validation & Tagging
 
 on:
   workflow_call:
     inputs:
       spec-path:
-        description: 'Path to the OpenAPI contract file to validate'
+        description: '需要进行验证的 OpenAPI 规范文件路径'
         required: true
         type: string
       create-tag:
-        description: 'If true, create and push a new tag upon success'
+        description: '如果为 true, 在检查成功后自动创建并推送一个新标签'
         required: false
         type: boolean
         default: false
 
+# 优化 1: 显式声明顶层权限为 read，遵循最小权限原则
+permissions:
+  contents: read
+
 jobs:
-  # --- Job 1: Run all validation steps ---
   validate:
     name: Validate OpenAPI Contract
     runs-on: ubuntu-latest
@@ -64,40 +57,61 @@ jobs:
           set -e
           CONTRACT_FILE="${{ inputs.spec-path }}"
           
-          echo "=== Checking OpenAPI version ==="
+          echo "=== [硬性校验] 检查 OpenAPI 版本 ==="
           OPENAPI_VERSION=$(yq '.openapi' "$CONTRACT_FILE")
           if ! echo "$OPENAPI_VERSION" | grep -E '^3\.1\.' >/dev/null; then
-            echo "❌ Error: OpenAPI version must be 3.1.x (found $OPENAPI_VERSION)"; exit 1;
+            echo "❌ 错误: OpenAPI 版本必须是 3.1.x (当前: $OPENAPI_VERSION)"; exit 1;
           fi
           echo "✅ OpenAPI 3.1.x OK"
 
-          echo "=== Checking info.x-qapi-profile ==="
+          echo "=== [硬性校验] 检查 info.x-qapi-profile ==="
           QAPI_PROFILE=$(yq '.info."x-qapi-profile"' "$CONTRACT_FILE")
           if [ "$QAPI_PROFILE" != "3.3" ]; then
-            echo "❌ Error: info.x-qapi-profile must be \"3.3\" (found $QAPI_PROFILE)"; exit 1;
+            echo "❌ 错误: info.x-qapi-profile 必须是 \"3.3\" (当前: $QAPI_PROFILE)"; exit 1;
           fi
           echo "✅ x-qapi-profile=3.3 OK"
-          
-          # ... other hard checks from your original file would go here ...
 
-          echo "✅ All Q-API 3.3 hard checks passed"
+          # 优化 4: 新增更扎实的硬性校验
+          echo "=== [硬性校验] 检查 X-QAPI-Version header enum 包含 3.3 ==="
+          yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' -e "$CONTRACT_FILE" >/dev/null \
+            || { echo "❌ components.headers.X-QAPI-Version.schema.enum 必须包含 \"3.3\""; exit 1; }
+          echo "✅ X-QAPI-Version OK"
+
+          echo "=== [硬性校验] 检查 oauth2 security scheme ==="
+          [ "$(yq '.components.securitySchemes.oauth2.type' "$CONTRACT_FILE")" = "oauth2" ] \
+            || { echo "❌ components.securitySchemes.oauth2.type 必须是 oauth2"; exit 1; }
+          echo "✅ oauth2 scheme OK"
+
+          echo "=== [硬性校验] 检查每个 path 是否都有 x-qapi-domain ==="
+          MISSING=$(yq '.paths | to_entries[] | select(.value | type=="object") | .value | to_entries[] | select(.value."x-qapi-domain" == null) | .key' "$CONTRACT_FILE")
+          if [ -n "$MISSING" ]; then
+            echo "❌ 在以下操作中缺少 x-qapi-domain:"; echo "$MISSING"; exit 1
+          fi
+          echo "✅ 所有操作都包含 x-qapi-domain"
+
+          echo "✅ 所有 Q-API 3.3 硬性检查通过"
 
       - name: Test SDK generation (Docker)
         run: |
           set -e
           VER=7.5.0
           echo "Generating TypeScript SDK to .sdk-test ..."
-          docker run --rm -v "${{ github.workspace }}:/local" openapitools/openapi-generator-cli:v$VER \
-            generate -i "/local/${{ inputs.spec-path }}" -g typescript-fetch -o /local/.sdk-test --skip-validate-spec
-          echo "✅ SDK generation smoke test OK"
+          docker pull "openapitools/openapi-generator-cli:v$VER"
+          # 优化 2 & 3: 指定 runner 用户属主，并统一使用 typescript-axios
+          docker run --rm --user "$(id -u)":"$(id -g)" \
+            -v "${{ github.workspace }}:/local" \
+            openapitools/openapi-generator-cli:v$VER \
+            generate -i "/local/${{ inputs.spec-path }}" -g typescript-axios \
+            -o /local/.sdk-test --skip-validate-spec
+          echo "✅ SDK 生成冒烟测试 OK"
 
-  # --- Job 2: Automatically create a new tag ---
   tag-release:
     name: Create and Push Tag
     if: inputs.create-tag == true
     needs: validate
     runs-on: ubuntu-latest
     permissions:
+      # 此处权限被精准提升
       contents: write
 
     steps:
