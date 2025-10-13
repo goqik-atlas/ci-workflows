@@ -42,7 +42,6 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           sudo apt-get update -y && sudo apt-get install -y jq
 
-      # —— Linter 仅告警，不阻断 ——
       - name: Redocly lint (warn only)
         shell: bash
         run: |
@@ -55,7 +54,6 @@ jobs:
           npm i -g @stoplight/spectral-cli@6.11.1
           spectral lint "${{ inputs.spec-path }}" || true
 
-      # —— 必要硬检查（尽量宽容） ——
       - name: Q-API 3.3 hard checks (relaxed)
         shell: bash
         run: |
@@ -99,7 +97,6 @@ jobs:
 
           echo "✅ Hard checks passed."
 
-      # 可选：OpenAPI 官方验证（容器版）
       - name: openapi-generator validate
         shell: bash
         run: |
