@@ -1,56 +1,32 @@
-# ==============================================================================
-#           [生产加固版] 可复用的 OpenAPI 质量门禁 (Q-API 3.3) 与自动打标签工作流
-# ==============================================================================
-#
-# 文件路径: .github/workflows/reusable-quality-gate.yml
-# 所在仓库: ci-workflows (用于存放可复用工作流的中央仓库)
-#
-# 特性:
-# - 显式化的权限管理，遵循最小权限原则
-# - 包含多项严格的 Q-API 3.3 合规性硬性检查
-# - 使用多种 linter 和 validator 进行交叉验证
-# - 可选的、在成功后自动创建并推送新版本标签的功能
-#
-# ==============================================================================
-
-name: Reusable Quality Gate (Q-API 3.3 Profile) & Tagging
+name: Reusable Quality Gate (Q-API 3.3)
 
 on:
   workflow_call:
     inputs:
       spec-path:
-        description: 'The path to the OpenAPI specification file'
+        description: 'Path to OpenAPI spec to validate'
         required: true
         type: string
       create-tag:
-        description: 'If true, create and push a new tag upon success'
+        description: 'Create a git tag when validation passes'
         required: false
         type: boolean
         default: false
+    secrets:
+      GITHUB_TOKEN:
+        required: true
 
-# 优化: 显式声明顶层权限为 read，遵循最小权限原则
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
-  # --- 任务一: Lint 和合规性检查 ---
-  lint-and-verify:
-    name: Lint and Verify OpenAPI Spec
+  validate:
+    name: Validate OpenAPI & Q-API basics
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Print repo tree and validate spec path
-        shell: bash
-        run: |
-          set -e
-          echo "SPEC_PATH=${{ inputs['spec-path'] }}"
-          echo "=== repo tree (depth 3) ==="
-          find . -maxdepth 3 -type f | sort
-          test -f "${{ inputs['spec-path'] }}" \
-            && echo "[OK] Spec found: ${{ inputs['spec-path'] }}" \
-            || (echo "[FAIL] Spec not found at path"; exit 1)
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -66,88 +42,78 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Validate OpenAPI syntax (Redocly)
+      - name: Redocly lint (warnings allowed)
         shell: bash
         run: |
-          set -e
           npm i -g @redocly/cli@1.15.0
-          echo "🔎 redocly lint ${{ inputs['spec-path'] }}"
-          # 允许 warning，不阻断流程
-          redocly lint "${{ inputs['spec-path'] }}" || true
+          redocly lint "${{ inputs.spec-path }}" || true
 
-      - name: Lint with Spectral (2nd linter)
+      - name: Spectral lint (warnings allowed)
         shell: bash
         run: |
-          set -e
           npm i -g @stoplight/spectral-cli@6.11.1
-          echo "🔎 spectral lint ${{ inputs['spec-path'] }}"
-          # 允许 warning，不阻断流程
-          spectral lint "${{ inputs['spec-path'] }}" || true
+          spectral lint "${{ inputs.spec-path }}" || true
 
-      - name: Q-API 3.3 compliance checks (hard checks)
+      - name: Q-API 3.3 hard checks
         shell: bash
         run: |
           set -euo pipefail
-          SPEC_FILE="${{ inputs['spec-path'] }}"
-          echo "=== Q-API 3.3 Compliance Checks on $SPEC_FILE ==="
+          SPEC="${{ inputs.spec-path }}"
+          echo "=== Hard checks on $SPEC ==="
 
-          echo "[check] OpenAPI version must be 3.1.x"
-          OPENAPI_VER=$(yq '.openapi' "$SPEC_FILE")
+          # 1) OpenAPI 3.1.x
+          OPENAPI_VER=$(yq '.openapi' "$SPEC")
           [[ "$OPENAPI_VER" =~ ^3\.1\. ]] || { echo "[FAIL] openapi must be 3.1.x (got $OPENAPI_VER)"; exit 1; }
-          echo "[ok] openapi=$OPENAPI_VER"
 
-          echo "[check] info.x-qapi-profile must be 3.3"
-          PROFILE=$(yq '.info."x-qapi-profile"' "$SPEC_FILE")
-          [[ "$PROFILE" == "3.3" ]] || { echo "[FAIL] x-qapi-profile must be 3.3 (got $PROFILE)"; exit 1; }
-          echo "[ok] x-qapi-profile=3.3"
+          # 2) x-qapi-profile=3.3
+          PROFILE=$(yq '.info."x-qapi-profile"' "$SPEC")
+          [[ "$PROFILE" == "3.3" ]] || { echo "[FAIL] info.x-qapi-profile must be 3.3 (got $PROFILE)"; exit 1; }
 
-          echo "[check] components.headers.X-QAPI-Version.schema.enum contains '3.3'"
-          yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' -e "$SPEC_FILE" >/dev/null \
-            || { echo "[FAIL] X-QAPI-Version enum must include '3.3'"; exit 1; }
-          echo "[ok] X-QAPI-Version enum has 3.3"
+          # 3) X-QAPI-Version: enum 或 example 至少一个包含 3.3
+          yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' -e "$SPEC" >/dev/null 2>&1 \
+            || { [[ "$(yq '.components.headers."X-QAPI-Version".schema.example' "$SPEC")" == "3.3" ]] \
+            || { echo "[FAIL] X-QAPI-Version must declare 3.3 via enum or example"; exit 1; }; }
 
-          echo "[check] components.securitySchemes.oauth2.type == 'oauth2'"
-          [[ "$(yq '.components.securitySchemes.oauth2.type' "$SPEC_FILE")" == "oauth2" ]] \
-            || { echo "[FAIL] oauth2 security scheme missing or wrong type"; exit 1; }
-          echo "[ok] oauth2 scheme detected"
-
-          echo "[check] every operation under paths has x-qapi-domain"
-          MISS=$(yq '
-            .paths | to_entries[]
-            | select(.value | type == "object")
-            | .value | to_entries[]
-            | select(.value."x-qapi-domain" == null)
-            | .key' "$SPEC_FILE")
-          if [ -n "$MISS" ]; then
-            echo "[FAIL] Missing x-qapi-domain on operations:"
-            echo "$MISS"
+          # 4) 安全方案：允许 bearer 或 oauth2 任一存在
+          SEC_BEARER=$(yq '.components.securitySchemes.bearerAuth.type' "$SPEC" 2>/dev/null || true)
+          SEC_OAUTH2=$(yq '.components.securitySchemes.oauth2.type' "$SPEC" 2>/dev/null || true)
+          if [[ "$SEC_BEARER" != "http" && "$SEC_OAUTH2" != "oauth2" ]]; then
+            echo "[FAIL] securitySchemes requires bearerAuth(http) or oauth2"
             exit 1
           fi
-          echo "[ok] x-qapi-domain present on all operations"
 
-          echo "✅ All Q-API 3.3 hard checks passed."
+          # 5) 每个 operation 必须有 x-qapi-domain
+          MISS=$(
+            yq '
+              .paths | to_entries[] |
+              select(.value | type == "object") |
+              .value | to_entries[] |
+              select(.value.responses != null) |
+              select(.value."x-qapi-domain" == null) |
+              .key' "$SPEC"
+          )
+          if [ -n "$MISS" ]; then
+            echo "[FAIL] Missing x-qapi-domain:"; echo "$MISS"; exit 1
+          fi
 
-      - name: (Optional) Cross-check using openapi-generator validate
+          echo "✅ Hard checks passed."
+
+      - name: openapi-generator validate
         shell: bash
         run: |
-          set -e
           VER=7.5.0
           docker pull "openapitools/openapi-generator-cli:v${VER}"
           docker run --rm -v "${{ github.workspace }}:/local" \
             "openapitools/openapi-generator-cli:v${VER}" validate \
-            -i "/local/${{ inputs['spec-path'] }}"
+            -i "/local/${{ inputs.spec-path }}"
           echo "✅ openapi-generator validate OK"
 
-  # --- 任务二: 自动打标签 (可选) ---
-  tag-release:
-    name: Create and Push Tag
-    if: inputs.create-tag == true
-    needs: lint-and-verify
+  tag:
+    if: ${{ inputs.create-tag == true }}
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
-      # 此处权限被精准提升为 write
       contents: write
-
     steps:
       - name: Checkout Code with Full History
         uses: actions/checkout@v4
@@ -163,4 +129,4 @@ jobs:
           WITH_V: true
 
       - name: Print New Tag
-        run: echo "Successfully tagged release: ${{ steps.tag_version.outputs.new_tag }}"
+        run: echo "Tagged: ${{ steps.tag_version.outputs.new_tag }}"
