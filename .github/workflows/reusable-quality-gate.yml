@@ -1,14 +1,14 @@
-name: Reusable Quality Gate (Q-API 3.3)
+name: Reusable Quality Gate (Q-API 3.3 · relaxed v0.9)
 
 on:
   workflow_call:
     inputs:
       spec-path:
-        description: 'Path to OpenAPI spec to validate'
+        description: Path to OpenAPI spec to validate
         required: true
         type: string
       create-tag:
-        description: 'Create a git tag when validation passes'
+        description: Create a git tag when validation passes
         required: false
         type: boolean
         default: false
@@ -42,19 +42,21 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Redocly lint (warnings allowed)
+      # —— Linter 仅告警，不阻断 ——
+      - name: Redocly lint (warn only)
         shell: bash
         run: |
           npm i -g @redocly/cli@1.15.0
           redocly lint "${{ inputs.spec-path }}" || true
 
-      - name: Spectral lint (warnings allowed)
+      - name: Spectral lint (warn only)
         shell: bash
         run: |
           npm i -g @stoplight/spectral-cli@6.11.1
           spectral lint "${{ inputs.spec-path }}" || true
 
-      - name: Q-API 3.3 hard checks
+      # —— 必要硬检查（尽量宽容） ——
+      - name: Q-API 3.3 hard checks (relaxed)
         shell: bash
         run: |
           set -euo pipefail
@@ -64,40 +66,40 @@ jobs:
           # 1) OpenAPI 3.1.x
           OPENAPI_VER=$(yq '.openapi' "$SPEC")
           [[ "$OPENAPI_VER" =~ ^3\.1\. ]] || { echo "[FAIL] openapi must be 3.1.x (got $OPENAPI_VER)"; exit 1; }
+          echo "[ok] openapi=$OPENAPI_VER"
 
           # 2) x-qapi-profile=3.3
           PROFILE=$(yq '.info."x-qapi-profile"' "$SPEC")
           [[ "$PROFILE" == "3.3" ]] || { echo "[FAIL] info.x-qapi-profile must be 3.3 (got $PROFILE)"; exit 1; }
+          echo "[ok] x-qapi-profile=3.3"
 
-          # 3) X-QAPI-Version: enum 或 example 至少一个包含 3.3
+          # 3) headers.X-QAPI-Version: enum 或 example 至少包含 "3.3"
           yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' -e "$SPEC" >/dev/null 2>&1 \
             || { [[ "$(yq '.components.headers."X-QAPI-Version".schema.example' "$SPEC")" == "3.3" ]] \
-            || { echo "[FAIL] X-QAPI-Version must declare 3.3 via enum or example"; exit 1; }; }
+            || { echo "[FAIL] headers.X-QAPI-Version must declare 3.3 via enum or example"; exit 1; }; }
+          echo "[ok] X-QAPI-Version declares 3.3"
 
-          # 4) 安全方案：允许 bearer 或 oauth2 任一存在
+          # 4) 安全方案：允许 bearer(http) 或 oauth2 任一存在
           SEC_BEARER=$(yq '.components.securitySchemes.bearerAuth.type' "$SPEC" 2>/dev/null || true)
           SEC_OAUTH2=$(yq '.components.securitySchemes.oauth2.type' "$SPEC" 2>/dev/null || true)
           if [[ "$SEC_BEARER" != "http" && "$SEC_OAUTH2" != "oauth2" ]]; then
-            echo "[FAIL] securitySchemes requires bearerAuth(http) or oauth2"
+            echo "[FAIL] need bearerAuth(http) or oauth2 in components.securitySchemes"
             exit 1
           fi
+          echo "[ok] securitySchemes present"
 
-          # 5) 每个 operation 必须有 x-qapi-domain
+          # 5) 每个 operation 都要有 x-qapi-domain（仅对 responses 存在的子键判断）
           MISS=$(
-            yq '
-              .paths | to_entries[] |
-              select(.value | type == "object") |
-              .value | to_entries[] |
-              select(.value.responses != null) |
-              select(.value."x-qapi-domain" == null) |
-              .key' "$SPEC"
+            yq '.paths|to_entries[]|.value|to_entries[]|select(.value.responses!=null)|select(.value."x-qapi-domain"==null)|.key' "$SPEC"
           )
           if [ -n "$MISS" ]; then
-            echo "[FAIL] Missing x-qapi-domain:"; echo "$MISS"; exit 1
+            echo "[FAIL] Missing x-qapi-domain on operations:"; echo "$MISS"; exit 1
           fi
+          echo "[ok] x-qapi-domain present on all operations"
 
           echo "✅ Hard checks passed."
 
+      # 可选：OpenAPI 官方验证（容器版）
       - name: openapi-generator validate
         shell: bash
         run: |
@@ -119,7 +121,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Bump Version and Push Tag
         id: tag_version
         uses: anothrNick/github-tag-action@1.67.0
@@ -127,6 +128,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BUMP: patch
           WITH_V: true
-
       - name: Print New Tag
         run: echo "Tagged: ${{ steps.tag_version.outputs.new_tag }}"
