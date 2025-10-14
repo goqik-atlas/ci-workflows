@@ -1,32 +1,49 @@
-name: Reusable Quality Gate (Q-API 3.3 · relaxed v0.9)
+name: Reusable Quality Gate (Q-API 3.3 Profile) & Tagging
 
 on:
   workflow_call:
     inputs:
       spec-path:
-        description: Path to OpenAPI spec to validate
+        description: 'Path to the OpenAPI spec file'
         required: true
         type: string
       create-tag:
-        description: Create a git tag when validation passes
+        description: 'If true, create and push a new git tag after success'
         required: false
         type: boolean
         default: false
-    secrets:
-      GITHUB_TOKEN:
-        required: true
+      manifest-path:
+        description: 'Path to per-repo domain rules manifest (required ops list)'
+        required: false
+        type: string
+        default: '.qapi/gate.yaml'
+      enforce-required-ops:
+        description: 'Treat required ops in manifest as hard checks (true) or warnings (false)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
-  validate:
-    name: Validate OpenAPI & Q-API basics
+  lint-and-verify:
+    name: Lint and Verify OpenAPI Spec
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Print repo tree and validate spec path
+        shell: bash
+        run: |
+          set -e
+          echo "SPEC_PATH=${{ inputs['spec-path'] }}"
+          echo "MANIFEST_PATH=${{ inputs['manifest-path'] }}"
+          echo "=== repo tree (depth 3) ==="
+          find . -maxdepth 3 -type f | sort || true
+          test -f "${{ inputs['spec-path'] }}" \
+            && echo "[OK] Spec found" || { echo "[FAIL] Spec not found"; exit 1; }
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -42,74 +59,106 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Redocly lint (warn only)
+      - name: Validate OpenAPI syntax (Redocly)
         shell: bash
         run: |
+          set -e
           npm i -g @redocly/cli@1.15.0
-          redocly lint "${{ inputs.spec-path }}" || true
+          redocly lint "${{ inputs['spec-path'] }}" || true
 
-      - name: Spectral lint (warn only)
+      - name: Lint with Spectral (secondary)
         shell: bash
         run: |
+          set -e
           npm i -g @stoplight/spectral-cli@6.11.1
-          spectral lint "${{ inputs.spec-path }}" || true
+          spectral lint "${{ inputs['spec-path'] }}" || true
 
-      - name: Q-API 3.3 hard checks (relaxed)
+      - name: Q-API 3.3 compliance checks (hard checks)
         shell: bash
         run: |
           set -euo pipefail
-          SPEC="${{ inputs.spec-path }}"
-          echo "=== Hard checks on $SPEC ==="
-
-          # 1) OpenAPI 3.1.x
+          SPEC="${{ inputs['spec-path'] }}"
+          echo "=== Q-API 3.3 Compliance (hard) ==="
           OPENAPI_VER=$(yq '.openapi' "$SPEC")
           [[ "$OPENAPI_VER" =~ ^3\.1\. ]] || { echo "[FAIL] openapi must be 3.1.x (got $OPENAPI_VER)"; exit 1; }
-          echo "[ok] openapi=$OPENAPI_VER"
-
-          # 2) x-qapi-profile=3.3
           PROFILE=$(yq '.info."x-qapi-profile"' "$SPEC")
           [[ "$PROFILE" == "3.3" ]] || { echo "[FAIL] info.x-qapi-profile must be 3.3 (got $PROFILE)"; exit 1; }
-          echo "[ok] x-qapi-profile=3.3"
-
-          # 3) headers.X-QAPI-Version: enum 或 example 至少包含 "3.3"
-          yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' -e "$SPEC" >/dev/null 2>&1 \
-            || { [[ "$(yq '.components.headers."X-QAPI-Version".schema.example' "$SPEC")" == "3.3" ]] \
-            || { echo "[FAIL] headers.X-QAPI-Version must declare 3.3 via enum or example"; exit 1; }; }
-          echo "[ok] X-QAPI-Version declares 3.3"
-
-          # 4) 安全方案：允许 bearer(http) 或 oauth2 任一存在
-          SEC_BEARER=$(yq '.components.securitySchemes.bearerAuth.type' "$SPEC" 2>/dev/null || true)
-          SEC_OAUTH2=$(yq '.components.securitySchemes.oauth2.type' "$SPEC" 2>/dev/null || true)
-          if [[ "$SEC_BEARER" != "http" && "$SEC_OAUTH2" != "oauth2" ]]; then
-            echo "[FAIL] need bearerAuth(http) or oauth2 in components.securitySchemes"
-            exit 1
-          fi
-          echo "[ok] securitySchemes present"
-
-          # 5) 每个 operation 都要有 x-qapi-domain（仅对 responses 存在的子键判断）
-          MISS=$(
-            yq '.paths|to_entries[]|.value|to_entries[]|select(.value.responses!=null)|select(.value."x-qapi-domain"==null)|.key' "$SPEC"
-          )
+          yq '.components.headers."X-QAPI-Version".schema.enum[] | select(.=="3.3")' "$SPEC" >/dev/null \
+            || { echo "[FAIL] X-QAPI-Version enum must include 3.3"; exit 1; }
+          [[ "$(yq '.components.securitySchemes.oauth2.type' "$SPEC")" == "oauth2" ]] \
+            || { echo "[FAIL] components.securitySchemes.oauth2.type must be oauth2"; exit 1; }
+          MISS=$(yq '
+            .paths | to_entries[]
+            | select(.value | type == "object")
+            | .value | to_entries[]
+            | select(.value."x-qapi-domain" == null)
+            | .key' "$SPEC")
           if [ -n "$MISS" ]; then
             echo "[FAIL] Missing x-qapi-domain on operations:"; echo "$MISS"; exit 1
           fi
-          echo "[ok] x-qapi-domain present on all operations"
+          echo "✅ Core 3.3 checks passed."
 
-          echo "✅ Hard checks passed."
-
-      - name: openapi-generator validate
+      - name: (Soft/Hard) check required operations from manifest
         shell: bash
         run: |
+          set -euo pipefail
+          SPEC="${{ inputs['spec-path'] }}"
+          MANI="${{ inputs['manifest-path'] }}"
+          ENF="${{ inputs['enforce-required-ops'] }}"
+          if [ ! -f "$MANI" ]; then
+            echo "[info] manifest not found ($MANI). Skip per-domain checks."
+            exit 0
+          fi
+
+          echo "=== Per-domain required ops from $MANI (enforce=$ENF) ==="
+          total=$(yq '.required_operations | length' "$MANI" 2>/dev/null || echo 0)
+          if [ "$total" -eq 0 ]; then
+            echo "[info] no required_operations defined."
+            exit 0
+          fi
+
+          fail=0
+          for i in $(seq 0 $((total-1))); do
+            path=$(yq -r ".required_operations[$i].path" "$MANI")
+            method=$(yq -r ".required_operations[$i].method" "$MANI")
+            wstatus=$(yq -r ".required_operations[$i].write_status // \"\"" "$MANI")
+
+            present=$(yq -r ".paths[\"$path\"].$method | type" "$SPEC" 2>/dev/null || echo "null")
+            if [ "$present" = "null" ]; then
+              echo "[${ENF:+FAIL}${ENF:-WARN}] missing operation: $method $path"
+              [ "$ENF" = "true" ] && fail=1
+              continue
+            fi
+
+            if [ -n "$wstatus" ]; then
+              actual=$(yq -r ".paths[\"$path\"].$method.\"x-qapi-write\".status // \"\"" "$SPEC")
+              if [ "$actual" != "$wstatus" ]; then
+                echo "[${ENF:+FAIL}${ENF:-WARN}] x-qapi-write.status mismatch on $method $path (want: $wstatus, got: ${actual:-<empty>})"
+                [ "$ENF" = "true" ] && fail=1
+              fi
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo "[FAIL] per-domain required ops checks failed."
+            exit 1
+          fi
+          echo "✅ per-domain required ops checks done."
+
+      - name: Cross-check with openapi-generator validate
+        shell: bash
+        run: |
+          set -e
           VER=7.5.0
           docker pull "openapitools/openapi-generator-cli:v${VER}"
           docker run --rm -v "${{ github.workspace }}:/local" \
-            "openapitools/openapi-generator-cli:v${VER}" validate \
-            -i "/local/${{ inputs.spec-path }}"
+            "openapitools/openapi-generator-cli:v${VER}" validate -i "/local/${{ inputs['spec-path'] }}"
           echo "✅ openapi-generator validate OK"
 
-  tag:
-    if: ${{ inputs.create-tag == true }}
-    needs: validate
+  tag-release:
+    name: Create and Push Tag
+    if: inputs.create-tag == true
+    needs: lint-and-verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -118,7 +167,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Bump Version and Push Tag
         id: tag_version
         uses: anothrNick/github-tag-action@1.67.0
@@ -126,6 +174,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BUMP: patch
           WITH_V: true
-
       - name: Print New Tag
-        run: echo "Tagged: ${{ steps.tag_version.outputs.new_tag }}"
+        run: echo "Successfully tagged release: ${{ steps.tag_version.outputs.new_tag }}"
