@@ -13,12 +13,12 @@ on:
         type: boolean
         default: false
       manifest-path:
-        description: 'Path to per-repo domain rules manifest (required ops list)'
+        description: 'Per-repo domain rules manifest (required ops list)'
         required: false
         type: string
         default: '.qapi/gate.yaml'
       enforce-required-ops:
-        description: 'Treat required ops in manifest as hard checks (true) or warnings (false)'
+        description: 'Treat required ops as hard-fail (true) or warnings (false)'
         required: false
         type: boolean
         default: false
@@ -43,7 +43,8 @@ jobs:
           echo "=== repo tree (depth 3) ==="
           find . -maxdepth 3 -type f | sort || true
           test -f "${{ inputs['spec-path'] }}" \
-            && echo "[OK] Spec found" || { echo "[FAIL] Spec not found"; exit 1; }
+            && echo "[OK] Spec found" \
+            || { echo "[FAIL] Spec not found at ${{ inputs['spec-path'] }}"; exit 1; }
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -94,7 +95,9 @@ jobs:
             | select(.value."x-qapi-domain" == null)
             | .key' "$SPEC")
           if [ -n "$MISS" ]; then
-            echo "[FAIL] Missing x-qapi-domain on operations:"; echo "$MISS"; exit 1
+            echo "[FAIL] Missing x-qapi-domain on operations:"
+            echo "$MISS"
+            exit 1
           fi
           echo "✅ Core 3.3 checks passed."
 
